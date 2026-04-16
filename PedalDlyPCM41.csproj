@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OutputType>Library</OutputType>
+    <AssemblyName>Pedal Dly PCM41.NET</AssemblyName>
+    <RootNamespace>WDE.PedalDlyPCM41</RootNamespace>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Optimize>true</Optimize>
+
+    <!--
+      Output goes straight into the ReBuzz Effects gear folder.
+      Override BuzzDir on the command line if ReBuzz is installed elsewhere:
+        dotnet build PedalDlyPCM41.csproj -c Release /p:BuzzDir="D:\ReBuzz"
+    -->
+    <BuzzDir Condition="'$(BuzzDir)' == ''">C:\Program Files\ReBuzz</BuzzDir>
+    <OutputPath>$(BuzzDir)\Gear\Effects</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
+  <!--
+    ReBuzz managed-machine API DLLs – not on NuGet, they ship with ReBuzz.
+    Private=false means they will NOT be copied into the output folder
+    (ReBuzz already has them at runtime).
+  -->
+  <ItemGroup>
+    <!-- Buzz.MachineInterface: IBuzzMachine, MachineDecl, ParameterDecl,
+                                IBuzzMachineHost, Sample, WorkModes -->
+    <Reference Include="ReBuzz">
+      <HintPath>$(BuzzDir)\ReBuzz.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- BuzzGUI types used by the managed machine infrastructure -->
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>$(BuzzDir)\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

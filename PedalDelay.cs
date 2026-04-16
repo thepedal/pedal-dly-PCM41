@@ -1,0 +1,211 @@
+// Pedal Dly PCM41 – ReBuzz managed effect machine
+// Inspired by the Lexicon PCM41 digital delay processor.
+//
+// Features:
+//   • Delay time 1–2000 ms with sub-sample (linear) interpolation
+//   • Feedback with one-pole HF damping (tape-style warmth)
+//   • Sine-wave LFO for chorus / flanging modulation
+//   • Stereo ping-pong routing
+//   • Wet / dry mix
+//
+// Build:
+//   dotnet build PedalDlyPCM41.csproj -c Release
+//
+// The output DLL is written directly to:
+//   C:\Program Files\ReBuzz\Gear\Effects\
+
+using System;
+using Buzz.MachineInterface;
+
+namespace WDE.PedalDlyPCM41
+{
+    // =========================================================================
+    // Machine declaration
+    // =========================================================================
+
+    [MachineDecl(
+        Name        = "Pedal Dly PCM41",
+        ShortName   = "PdlPCM41",
+        Author      = "WDE",
+        MaxTracks   = 0,
+        InputCount  = 1,
+        OutputCount = 1)]
+    public class PedalDlyPCM41Machine : IBuzzMachine
+    {
+        IBuzzMachineHost host;
+
+        // ── Delay buffers ─────────────────────────────────────────────────────
+        // Sized for 2 s at 96 kHz plus LFO headroom (≈ 4 800 extra samples).
+        const int MAX_BUFFER = 200000;
+        readonly float[] bufL = new float[MAX_BUFFER];
+        readonly float[] bufR = new float[MAX_BUFFER];
+        int writePos;
+
+        // ── One-pole LP filter state (HF damping in feedback path) ────────────
+        float dampL;
+        float dampR;
+
+        // ── LFO state ─────────────────────────────────────────────────────────
+        double lfoPhase;   // normalised 0–1
+
+        // ── Constructor ───────────────────────────────────────────────────────
+        public PedalDlyPCM41Machine(IBuzzMachineHost host) => this.host = host;
+
+        // =========================================================================
+        // Parameters
+        // =========================================================================
+
+        /// <summary>Delay time in milliseconds (1–2000).</summary>
+        [ParameterDecl(
+            Name        = "Delay",
+            Description = "Delay time in milliseconds",
+            MinValue    = 1,
+            MaxValue    = 2000,
+            DefValue    = 250)]
+        public int DelayMs { get; set; } = 250;
+
+        /// <summary>Amount of signal fed back into the delay line (0–99 %).</summary>
+        [ParameterDecl(
+            Name        = "Feedback",
+            Description = "Feedback amount 0–99 %",
+            MinValue    = 0,
+            MaxValue    = 99,
+            DefValue    = 40)]
+        public int Feedback { get; set; } = 40;
+
+        /// <summary>Wet/dry blend.  0 = fully dry, 100 = fully wet.</summary>
+        [ParameterDecl(
+            Name        = "Mix",
+            Description = "Wet/dry mix (0 = dry, 100 = wet)",
+            MinValue    = 0,
+            MaxValue    = 100,
+            DefValue    = 50)]
+        public int Mix { get; set; } = 50;
+
+        /// <summary>
+        /// High-frequency damping applied to the feedback signal.
+        /// Emulates the gentle treble roll-off of analogue BBD / tape
+        /// circuits on the PCM41's input stage.
+        /// 0 = flat; 100 = heavy low-pass.
+        /// </summary>
+        [ParameterDecl(
+            Name        = "HF Damp",
+            Description = "High-frequency damping in the feedback path",
+            MinValue    = 0,
+            MaxValue    = 100,
+            DefValue    = 20)]
+        public int HFDamp { get; set; } = 20;
+
+        /// <summary>
+        /// LFO rate mapped 0–100 → 0–10 Hz.
+        /// Drives the PCM41-style pitch / time modulation for chorus and
+        /// flanging effects.
+        /// </summary>
+        [ParameterDecl(
+            Name        = "LFO Rate",
+            Description = "Modulation rate: 0 = off, 100 ≈ 10 Hz",
+            MinValue    = 0,
+            MaxValue    = 100,
+            DefValue    = 0)]
+        public int LFORate { get; set; } = 0;
+
+        /// <summary>LFO modulation depth mapped 0–100 → 0–25 ms.</summary>
+        [ParameterDecl(
+            Name        = "LFO Depth",
+            Description = "Modulation depth: 0 = none, 100 = 25 ms",
+            MinValue    = 0,
+            MaxValue    = 100,
+            DefValue    = 0)]
+        public int LFODepth { get; set; } = 0;
+
+        /// <summary>
+        /// Stereo ping-pong routing: left echoes appear on the right output
+        /// and vice-versa, giving a wide stereo bouncing effect.
+        /// </summary>
+        [ParameterDecl(
+            Name              = "Ping Pong",
+            Description       = "Stereo ping-pong delay routing",
+            MinValue          = 0,
+            MaxValue          = 1,
+            DefValue          = 0,
+            ValueDescriptions = new[] { "off", "on" })]
+        public int PingPong { get; set; } = 0;
+
+        // =========================================================================
+        // Audio processing
+        // =========================================================================
+
+        public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
+        {
+            if (mode == WorkModes.WM_NOIO)
+                return false;
+
+            // ── Precompute per-buffer constants ───────────────────────────────
+            float sr         = host.MasterInfo.SamplesPerSec;
+            float fbGain     = Feedback  / 100f;
+            float wet        = Mix       / 100f;
+            float dry        = 1f - wet;
+
+            // LFO: scale knob 0-100 to 0-10 Hz, depth to 0-25 ms.
+            float lfoRateHz  = LFORate  / 10f;
+            float lfoDepthMs = LFODepth / 4f;
+            double lfoInc    = (sr > 0f) ? (lfoRateHz / sr) : 0.0;
+
+            // One-pole LP: coeff = 0 → flat; 0.97 → heavy roll-off.
+            float dampCoeff  = HFDamp / 100f * 0.97f;
+            bool  pingPong   = PingPong != 0;
+
+            // ── Sample loop ───────────────────────────────────────────────────
+            for (int i = 0; i < n; i++)
+            {
+                // -- LFO sine (normalised phase 0-1) ---------------------------
+                float lfoVal = (float)Math.Sin(lfoPhase * (2.0 * Math.PI));
+                lfoPhase    += lfoInc;
+                if (lfoPhase >= 1.0) lfoPhase -= 1.0;
+
+                // -- Compute fractional read position --------------------------
+                float totalDelayMs   = Math.Max(1f, DelayMs + lfoVal * lfoDepthMs);
+                float delaySamples   = totalDelayMs * sr / 1000f;
+
+                // Guard against overrun
+                if (delaySamples >= MAX_BUFFER - 2f) delaySamples = MAX_BUFFER - 2f;
+
+                float readF = writePos - delaySamples;
+                if (readF < 0f) readF += MAX_BUFFER;
+
+                int   r0   = (int)readF % MAX_BUFFER;
+                int   r1   = (r0 + 1)  % MAX_BUFFER;
+                float frac = readF - (int)readF;
+
+                // -- Linear interpolation of delayed signal --------------------
+                float dL = bufL[r0] + frac * (bufL[r1] - bufL[r0]);
+                float dR = bufR[r0] + frac * (bufR[r1] - bufR[r0]);
+
+                // -- HF damping (one-pole LP applied to delayed output) --------
+                dampL = dampL * dampCoeff + dL * (1f - dampCoeff);
+                dampR = dampR * dampCoeff + dR * (1f - dampCoeff);
+
+                // -- Write into delay buffer (with feedback) -------------------
+                if (pingPong)
+                {
+                    // Cross-channel: incoming L is echoed on R and vice-versa.
+                    bufL[writePos] = input[i].L + dampR * fbGain;
+                    bufR[writePos] = input[i].R + dampL * fbGain;
+                }
+                else
+                {
+                    bufL[writePos] = input[i].L + dampL * fbGain;
+                    bufR[writePos] = input[i].R + dampR * fbGain;
+                }
+
+                writePos = (writePos + 1) % MAX_BUFFER;
+
+                // -- Output mix -----------------------------------------------
+                output[i].L = input[i].L * dry + dL * wet;
+                output[i].R = input[i].R * dry + dR * wet;
+            }
+
+            return true;
+        }
+    }
+}
