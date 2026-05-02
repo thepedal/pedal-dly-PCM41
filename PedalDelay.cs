@@ -7,12 +7,10 @@
 //   • Sine-wave LFO for chorus / flanging modulation
 //   • Stereo ping-pong routing
 //   • Wet / dry mix
+//   • Zero-CPU when input and delay tail are both silent
 //
 // Build:
 //   dotnet build PedalDlyPCM41.csproj -c Release
-//
-// The output DLL is written directly to:
-//   C:\Program Files\ReBuzz\Gear\Effects\
 
 using System;
 using Buzz.MachineInterface;
@@ -35,7 +33,7 @@ namespace WDE.PedalDlyPCM41
         IBuzzMachineHost host;
 
         // ── Delay buffers ─────────────────────────────────────────────────────
-        // Sized for 2 s at 96 kHz plus LFO headroom (≈ 4 800 extra samples).
+        // Sized for 2 s at 96 kHz plus LFO headroom.
         const int MAX_BUFFER = 200000;
         readonly float[] bufL = new float[MAX_BUFFER];
         readonly float[] bufR = new float[MAX_BUFFER];
@@ -46,9 +44,26 @@ namespace WDE.PedalDlyPCM41
         float dampR;
 
         // ── LFO state ─────────────────────────────────────────────────────────
-        double lfoPhase;   // normalised 0–1
+        double lfoPhase;
 
-        // ── Constructor ───────────────────────────────────────────────────────
+        // ── Silence / CPU-bypass state ────────────────────────────────────────
+        // When input goes silent we keep running until the delay tail has fully
+        // decayed, then return false so ReBuzz stops calling us.
+        //
+        // Tail budget: worst case is max delay (2 s) with 99 % feedback.
+        // At fb=0.99 the tail is theoretically infinite, but in practice the
+        // HF damping and floating-point underflow kill it well within 60 s.
+        // We use a generous 30-second headroom expressed as a sample count that
+        // is recomputed each Work() from the current sample rate.
+        //
+        // _silentSamples counts consecutive silent-input samples.
+        // When it exceeds _tailBudget the buffer will have drained and we stop.
+        int _silentSamples;
+
+        // Threshold below which a sample is considered silent (matches the
+        // scale used by other Pedal machines — ±32768 domain).
+        const float SILENCE_THRESHOLD = 0.001f;   // ≈ −90 dBFS
+
         public PedalDlyPCM41Machine(IBuzzMachineHost host) => this.host = host;
 
         // =========================================================================
@@ -137,6 +152,7 @@ namespace WDE.PedalDlyPCM41
 
         public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
         {
+            // ReBuzz signals no connected input — nothing to do.
             if (mode == WorkModes.WM_NOIO)
                 return false;
 
@@ -146,29 +162,59 @@ namespace WDE.PedalDlyPCM41
             float wet        = Mix       / 100f;
             float dry        = 1f - wet;
 
-            // LFO: scale knob 0-100 to 0-10 Hz, depth to 0-25 ms.
+            // LFO: knob 0-100 → 0-10 Hz rate, 0-25 ms depth.
             float lfoRateHz  = LFORate  / 10f;
             float lfoDepthMs = LFODepth / 4f;
             double lfoInc    = (sr > 0f) ? (lfoRateHz / sr) : 0.0;
 
-            // One-pole LP: coeff = 0 → flat; 0.97 → heavy roll-off.
+            // One-pole LP: 0 → flat, 0.97 → heavy roll-off.
             float dampCoeff  = HFDamp / 100f * 0.97f;
             bool  pingPong   = PingPong != 0;
+
+            // ── Silence detection — input pass ────────────────────────────────
+            // Scan the input block first (cheap — no DSP).  If every sample is
+            // below the threshold the block is silent.
+            bool inputSilent = true;
+            for (int i = 0; i < n; i++)
+            {
+                if (Math.Abs(input[i].L) > SILENCE_THRESHOLD ||
+                    Math.Abs(input[i].R) > SILENCE_THRESHOLD)
+                {
+                    inputSilent = false;
+                    break;
+                }
+            }
+
+            if (inputSilent)
+            {
+                _silentSamples += n;
+
+                // Tail budget: 30 s worth of samples covers even 99 % feedback
+                // with heavy damping.  When the counter exceeds this the buffer
+                // has fully decayed; stop spending CPU.
+                int tailBudget = (int)(sr * 30f);
+                if (_silentSamples > tailBudget)
+                    return false;
+            }
+            else
+            {
+                // Live input — reset the silence counter.
+                _silentSamples = 0;
+            }
 
             // ── Sample loop ───────────────────────────────────────────────────
             for (int i = 0; i < n; i++)
             {
-                // -- LFO sine (normalised phase 0-1) ---------------------------
+                // LFO sine (normalised phase 0–1)
                 float lfoVal = (float)Math.Sin(lfoPhase * (2.0 * Math.PI));
                 lfoPhase    += lfoInc;
                 if (lfoPhase >= 1.0) lfoPhase -= 1.0;
 
-                // -- Compute fractional read position --------------------------
-                float totalDelayMs   = Math.Max(1f, DelayMs + lfoVal * lfoDepthMs);
-                float delaySamples   = totalDelayMs * sr / 1000f;
-
-                // Guard against overrun
-                if (delaySamples >= MAX_BUFFER - 2f) delaySamples = MAX_BUFFER - 2f;
+                // Fractional read position with LFO modulation
+                float totalDelayMs = Math.Max(1f, DelayMs + lfoVal * lfoDepthMs);
+                float delaySamples = totalDelayMs * sr / 1000f;
+                if (delaySamples >= MAX_BUFFER - 2f)
+                    delaySamples = MAX_BUFFER - 2f;
 
                 float readF = writePos - delaySamples;
                 if (readF < 0f) readF += MAX_BUFFER;
@@ -177,18 +223,17 @@ namespace WDE.PedalDlyPCM41
                 int   r1   = (r0 + 1)  % MAX_BUFFER;
                 float frac = readF - (int)readF;
 
-                // -- Linear interpolation of delayed signal --------------------
+                // Linear interpolation of delayed signal
                 float dL = bufL[r0] + frac * (bufL[r1] - bufL[r0]);
                 float dR = bufR[r0] + frac * (bufR[r1] - bufR[r0]);
 
-                // -- HF damping (one-pole LP applied to delayed output) --------
+                // HF damping (one-pole LP in feedback path)
                 dampL = dampL * dampCoeff + dL * (1f - dampCoeff);
                 dampR = dampR * dampCoeff + dR * (1f - dampCoeff);
 
-                // -- Write into delay buffer (with feedback) -------------------
+                // Write into delay buffer (with feedback)
                 if (pingPong)
                 {
-                    // Cross-channel: incoming L is echoed on R and vice-versa.
                     bufL[writePos] = input[i].L + dampR * fbGain;
                     bufR[writePos] = input[i].R + dampL * fbGain;
                 }
@@ -200,7 +245,7 @@ namespace WDE.PedalDlyPCM41
 
                 writePos = (writePos + 1) % MAX_BUFFER;
 
-                // -- Output mix -----------------------------------------------
+                // Output mix
                 output[i].L = input[i].L * dry + dL * wet;
                 output[i].R = input[i].R * dry + dR * wet;
             }

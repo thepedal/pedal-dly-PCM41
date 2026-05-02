@@ -22,19 +22,11 @@
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
   </PropertyGroup>
 
-  <!--
-    ReBuzz managed-machine API DLLs – not on NuGet, they ship with ReBuzz.
-    Private=false means they will NOT be copied into the output folder
-    (ReBuzz already has them at runtime).
-  -->
   <ItemGroup>
-    <!-- Buzz.MachineInterface: IBuzzMachine, MachineDecl, ParameterDecl,
-                                IBuzzMachineHost, Sample, WorkModes -->
     <Reference Include="ReBuzz">
       <HintPath>$(BuzzDir)\ReBuzz.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <!-- BuzzGUI types used by the managed machine infrastructure -->
     <Reference Include="BuzzGUI.Interfaces">
       <HintPath>$(BuzzDir)\BuzzGUI.Interfaces.dll</HintPath>
       <Private>false</Private>

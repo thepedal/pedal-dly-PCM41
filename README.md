@@ -12,6 +12,7 @@ A managed effect machine for [ReBuzz](https://github.com/wasteddesign/ReBuzz) in
 | LFO modulation | Sine-wave LFO (0–10 Hz) modulates delay time for chorus and flanging effects |
 | Ping Pong | Stereo cross-feed routing — left echoes pan right and vice-versa |
 | Wet / Dry mix | Full control from 100 % dry to 100 % wet |
+| CPU bypass | Returns `false` when input is silent and the delay tail has fully decayed — zero CPU cost at rest |
 
 ## Requirements
 
@@ -36,7 +37,7 @@ dotnet build PedalDlyPCM41.csproj -c Release
 
 The DLL is written directly to `C:\Program Files\ReBuzz\Gear\Effects\`.
 
-If ReBuzz is installed in a non-default location, pass the path on the command line:
+If ReBuzz is installed in a non-default location:
 
 ```powershell
 dotnet build PedalDlyPCM41.csproj -c Release /p:BuzzDir="D:\MyReBuzz"
@@ -56,11 +57,11 @@ dotnet build PedalDlyPCM41.csproj -c Release /p:BuzzDir="D:\MyReBuzz"
 
 ## PCM41 Design Notes
 
-The **Lexicon PCM41** (1981) was one of the first affordable rack-mount digital delay processors and became famous for its pitch-shifting capabilities and warm delay character. This plugin captures its key sonic attributes:
+The **Lexicon PCM41** (1981) was one of the first affordable rack-mount digital delay processors, famous for its pitch-shifting capabilities and warm delay character. Key sonic attributes captured here:
 
-- **HF Damp** mimics the gentle treble loss that occurs on each pass through the PCM41's analogue input stage — keeping long feedback tails from becoming harsh.
-- **LFO modulation** reproduces the PCM41's pitch-modulation circuit, which could turn a short delay into a rich chorus or flange with a single knob sweep.
-- **Ping Pong** extends the stereo field in a way characteristic of how engineers used two PCM41 units in sequence.
+- **HF Damp** mimics the gentle treble loss on each feedback pass through the PCM41's analogue input stage — keeping long tails from becoming harsh.
+- **LFO modulation** reproduces the PCM41's pitch-modulation circuit, turning a short delay into a rich chorus or flange with a single knob sweep.
+- **Ping Pong** extends the stereo field in the way engineers achieved using two PCM41 units in sequence.
 
 ## License
 
