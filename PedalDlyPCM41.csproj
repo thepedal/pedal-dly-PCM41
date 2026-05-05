@@ -10,6 +10,10 @@
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <Optimize>true</Optimize>
+    <!-- Suppress MSB3277: ReBuzz ships assemblies built against older framework
+         versions (e.g. WindowsBase 4.0 vs 10.0). The conflicts are harmless —
+         the SDK picks the primary reference correctly — but noisy. -->
+    <NoWarn>MSB3277</NoWarn>
 
     <!--
       Output goes straight into the ReBuzz Effects gear folder.
