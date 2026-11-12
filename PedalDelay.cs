@@ -6,6 +6,10 @@
 //   • Feedback with one-pole HF damping (tape-style warmth)
 //   • Sine-wave LFO for chorus / flanging modulation (depth always in ms)
 //   • Stereo ping-pong routing
+//   • Echo filter (lowpass / highpass / bandpass / notch) on the delayed
+//     signal: each repeat passes through it again, so echoes darken, thin
+//     out or narrow progressively.  Peak gain is normalised to ≤ 1 so the
+//     feedback loop stays stable at any cutoff / bandwidth.
 //   • Wet / dry mix
 //   • Zero-CPU when input and delay tail are both silent
 //
@@ -13,7 +17,9 @@
 //   dotnet build PedalDlyPCM41.csproj -c Release
 
 using System;
+using System.Globalization;
 using Buzz.MachineInterface;
+using BuzzGUI.Interfaces;
 
 namespace WDE.PedalDlyPCM41
 {
@@ -43,6 +49,13 @@ namespace WDE.PedalDlyPCM41
         float dampL;
         float dampR;
 
+        // ── Echo filter state (RBJ biquad, transposed direct form II) ────────
+        float fz1L, fz2L, fz1R, fz2R;
+        float fb0, fb1, fb2, fa1, fa2;
+        // Coefficient cache key — recompute only when something changed.
+        int   fCacheType = -1, fCacheCutoff = -1, fCacheBw = -1;
+        float fCacheSr   = -1f;
+
         // ── LFO state ─────────────────────────────────────────────────────────
         double lfoPhase;
 
@@ -70,6 +83,19 @@ namespace WDE.PedalDlyPCM41
         const int MODE_MS      = 0;
         const int MODE_TICKS   = 1;
         const int MODE_SAMPLES = 2;
+
+        // ── Filter type constants ─────────────────────────────────────────────
+        const int FILT_OFF      = 0;
+        const int FILT_LOWPASS  = 1;
+        const int FILT_HIGHPASS = 2;
+        const int FILT_BANDPASS = 3;
+        const int FILT_NOTCH    = 4;
+
+        // ── Filter parameter mappings (shared by DSP and DescribeValue) ──────
+        // Cutoff:    0–1000 → 20 Hz … 20 kHz, logarithmic
+        // Bandwidth: 0–1000 → 10 Hz … 20 kHz, logarithmic
+        static float CutoffHz(int v)    => 20f * MathF.Pow(1000f, v / 1000f);
+        static float BandwidthHz(int v) => 10f * MathF.Pow(2000f, v / 1000f);
 
         // =========================================================================
         // Parameters
@@ -173,6 +199,127 @@ namespace WDE.PedalDlyPCM41
             ValueDescriptions = new[] { "off", "on" })]
         public int PingPong { get; set; } = 0;
 
+        // ── v1.2 — echo filter.  Appended after Ping Pong so the existing
+        // parameter order (and saved songs / presets / pattern columns) is
+        // untouched.  Default type is "off", so old songs sound the same.
+
+        /// <summary>Filter applied to the echoes (and to every repeat).</summary>
+        [ParameterDecl(
+            Name              = "Filter Type",
+            Description       = "Echo filter: off / lowpass / highpass / bandpass / notch",
+            MinValue          = 0,
+            MaxValue          = 4,
+            DefValue          = 0,
+            ValueDescriptions = new[] { "off", "lowpass", "highpass", "bandpass", "notch" })]
+        public int FilterType { get; set; } = FILT_OFF;
+
+        /// <summary>Filter cutoff / centre frequency, 20 Hz – 20 kHz (log).</summary>
+        [ParameterDecl(
+            Name        = "Filter Cutoff",
+            Description = "Echo filter cutoff / centre frequency (20 Hz – 20 kHz)",
+            MinValue    = 0,
+            MaxValue    = 1000,
+            DefValue    = 600)]
+        public int FilterCutoff { get; set; } = 600;
+
+        /// <summary>
+        /// Filter bandwidth in Hz, 10 Hz – 20 kHz (log).  Sets Q = cutoff /
+        /// bandwidth: narrow = resonant / tight band, wide = gentle.
+        /// </summary>
+        [ParameterDecl(
+            Name        = "Filter Bandwidth",
+            Description = "Echo filter bandwidth (10 Hz – 20 kHz); Q = cutoff / bandwidth",
+            MinValue    = 0,
+            MaxValue    = 1000,
+            DefValue    = 680)]
+        public int FilterBandwidth { get; set; } = 680;
+
+        // =========================================================================
+        // Value display
+        // =========================================================================
+
+        static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+
+        static string FormatHz(float hz) =>
+            hz < 1000f ? ((int)MathF.Round(hz)).ToString(Inv) + " Hz"
+                       : (hz / 1000f).ToString(hz < 10000f ? "0.00" : "0.0", Inv) + " kHz";
+
+        public string? DescribeValue(IParameter parameter, int value)
+        {
+            switch (parameter?.Name)
+            {
+                case "Filter Cutoff":    return FormatHz(CutoffHz(value));
+                case "Filter Bandwidth": return FormatHz(BandwidthHz(value));
+                default:                 return null;   // ValueDescriptions / raw number
+            }
+        }
+
+        // =========================================================================
+        // Echo filter coefficients (RBJ cookbook biquads)
+        // =========================================================================
+
+        /// <summary>
+        /// Recomputes the biquad coefficients if type / cutoff / bandwidth /
+        /// sample rate changed since the last call.  Called once per Work().
+        ///
+        /// Stability: every response is scaled so its peak gain is ≤ 1
+        /// (bandpass uses the 0 dB-peak form, notch never exceeds 1, LP/HP
+        /// are divided by their resonant peak).  With Feedback ≤ 99 % the loop
+        /// gain therefore stays below 1 and the delay can never run away, even
+        /// with a very narrow bandwidth.
+        /// </summary>
+        void UpdateFilter(int type, int cutoff, int bw, float sr)
+        {
+            if (type == fCacheType && cutoff == fCacheCutoff && bw == fCacheBw && sr == fCacheSr)
+                return;
+
+            // Switching the filter in from "off" starts from clean state.
+            if (fCacheType == FILT_OFF || fCacheType == -1)
+                fz1L = fz2L = fz1R = fz2R = 0f;
+
+            fCacheType = type; fCacheCutoff = cutoff; fCacheBw = bw; fCacheSr = sr;
+            if (type == FILT_OFF || sr <= 0f) return;
+
+            float fc = Math.Clamp(CutoffHz(cutoff), 10f, sr * 0.45f);
+            float q  = Math.Clamp(fc / BandwidthHz(bw), 0.1f, 20f);
+
+            float w0    = 2f * MathF.PI * fc / sr;
+            float cosw  = MathF.Cos(w0);
+            float alpha = MathF.Sin(w0) / (2f * q);
+
+            float b0, b1, b2;
+            float a0 = 1f + alpha, a1 = -2f * cosw, a2 = 1f - alpha;
+
+            switch (type)
+            {
+                case FILT_HIGHPASS:
+                    b0 = (1f + cosw) * 0.5f; b1 = -(1f + cosw); b2 = b0;
+                    break;
+                case FILT_BANDPASS:
+                    b0 = alpha; b1 = 0f; b2 = -alpha;
+                    break;
+                case FILT_NOTCH:
+                    b0 = 1f; b1 = -2f * cosw; b2 = 1f;
+                    break;
+                default: // FILT_LOWPASS
+                    b0 = (1f - cosw) * 0.5f; b1 = 1f - cosw; b2 = b0;
+                    break;
+            }
+
+            // LP / HP resonant peak = Q / sqrt(1 − 1/(4Q²)) for Q > 1/√2
+            // (the bilinear transform preserves the peak height).  Normalise it.
+            if ((type == FILT_LOWPASS || type == FILT_HIGHPASS) && q > 0.7072f)
+            {
+                float peak = q / MathF.Sqrt(1f - 1f / (4f * q * q));
+                float g = 1f / peak;
+                b0 *= g; b1 *= g; b2 *= g;
+            }
+
+            float inv = 1f / a0;
+            fb0 = b0 * inv; fb1 = b1 * inv; fb2 = b2 * inv;
+            fa1 = a1 * inv; fa2 = a2 * inv;
+        }
+
         // =========================================================================
         // Audio processing
         // =========================================================================
@@ -217,6 +364,13 @@ namespace WDE.PedalDlyPCM41
             // One-pole LP: 0 → flat, 0.97 → heavy roll-off.
             float dampCoeff  = HFDamp / 100f * 0.97f;
             bool  pingPong   = PingPong != 0;
+
+            // Echo filter coefficients (cached; cheap when unchanged).
+            int  filtType  = FilterType;
+            UpdateFilter(filtType, FilterCutoff, FilterBandwidth, sr);
+            bool filterOn  = filtType != FILT_OFF;
+            float b0 = fb0, b1 = fb1, b2 = fb2, a1 = fa1, a2 = fa2;
+            float z1L = fz1L, z2L = fz2L, z1R = fz1R, z2R = fz2R;
 
             // ── Silence detection — input pass ────────────────────────────────
             // Scan the input block first (cheap — no DSP).  If every sample is
@@ -273,6 +427,21 @@ namespace WDE.PedalDlyPCM41
                 float dL = bufL[r0] + frac * (bufL[r1] - bufL[r0]);
                 float dR = bufR[r0] + frac * (bufR[r1] - bufR[r0]);
 
+                // Echo filter (TDF-II biquad) — heard on the wet output and fed
+                // back, so each repeat is filtered once more.
+                if (filterOn)
+                {
+                    float yL = b0 * dL + z1L;
+                    z1L = b1 * dL - a1 * yL + z2L;
+                    z2L = b2 * dL - a2 * yL;
+                    dL  = yL;
+
+                    float yR = b0 * dR + z1R;
+                    z1R = b1 * dR - a1 * yR + z2R;
+                    z2R = b2 * dR - a2 * yR;
+                    dR  = yR;
+                }
+
                 // HF damping (one-pole LP in feedback path)
                 dampL = dampL * dampCoeff + dL * (1f - dampCoeff);
                 dampR = dampR * dampCoeff + dR * (1f - dampCoeff);
@@ -295,6 +464,13 @@ namespace WDE.PedalDlyPCM41
                 output[i].L = input[i].L * dry + dL * wet;
                 output[i].R = input[i].R * dry + dR * wet;
             }
+
+            // Store filter state, flushing denormals during long silent tails.
+            const float DENORM = 1e-15f;
+            fz1L = Math.Abs(z1L) < DENORM ? 0f : z1L;
+            fz2L = Math.Abs(z2L) < DENORM ? 0f : z2L;
+            fz1R = Math.Abs(z1R) < DENORM ? 0f : z1R;
+            fz2R = Math.Abs(z2R) < DENORM ? 0f : z2R;
 
             return true;
         }

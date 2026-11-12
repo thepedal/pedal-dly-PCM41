@@ -11,6 +11,7 @@ A managed effect machine for [ReBuzz](https://github.com/wasteddesign/ReBuzz) in
 | HF Damp | One-pole low-pass filter in the feedback path — emulates the gentle treble roll-off of BBD / tape circuits |
 | LFO modulation | Sine-wave LFO (0–10 Hz) modulates delay time for chorus and flanging effects |
 | Ping Pong | Stereo cross-feed routing — left echoes pan right and vice-versa |
+| Echo filter | Lowpass / highpass / bandpass / notch on the echoes; every repeat passes through it again, so echoes darken, thin or narrow progressively |
 | Wet / Dry mix | Full control from 100 % dry to 100 % wet |
 | CPU bypass | Returns `false` when input is silent and the delay tail has fully decayed — zero CPU cost at rest |
 
@@ -54,6 +55,11 @@ dotnet build PedalDlyPCM41.csproj -c Release /p:BuzzDir="D:\MyReBuzz"
 | LFO Rate | 0 – 100 | 0 | Modulation rate (0 = off, 100 ≈ 10 Hz) |
 | LFO Depth | 0 – 100 | 0 | Modulation depth (0 = none, 100 = ±25 ms) |
 | Ping Pong | off / on | off | Stereo ping-pong cross-feed routing |
+| Filter Type | off / lowpass / highpass / bandpass / notch | off | Echo filter type |
+| Filter Cutoff | 0 – 1000 (20 Hz – 20 kHz, log) | 600 (1.26 kHz) | Cutoff / centre frequency |
+| Filter Bandwidth | 0 – 1000 (10 Hz – 20 kHz, log) | 680 (1.75 kHz) | Bandwidth in Hz; Q = cutoff ÷ bandwidth (narrow = resonant / tight, wide = gentle) |
+
+The echo filter sits on the delayed signal, so it shapes the wet output and the feedback path. Its peak gain is normalised to 1 in every mode, so a narrow, resonant setting can't make the feedback run away. Cutoff and bandwidth display in Hz / kHz in the parameter window.
 
 ## PCM41 Design Notes
 
@@ -62,6 +68,11 @@ The **Lexicon PCM41** (1981) was one of the first affordable rack-mount digital 
 - **HF Damp** mimics the gentle treble loss on each feedback pass through the PCM41's analogue input stage — keeping long tails from becoming harsh.
 - **LFO modulation** reproduces the PCM41's pitch-modulation circuit, turning a short delay into a rich chorus or flange with a single knob sweep.
 - **Ping Pong** extends the stereo field in the way engineers achieved using two PCM41 units in sequence.
+
+## Changelog
+
+- **1.2** — Echo filter: Filter Type, Filter Cutoff, Filter Bandwidth (appended after Ping Pong; default off, so existing songs sound unchanged). No .pdb / .deps.json deployed.
+- **1.1** — Time Mode (ms / ticks / samples).
 
 ## License
 
