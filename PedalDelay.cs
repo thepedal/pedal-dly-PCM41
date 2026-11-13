@@ -30,7 +30,7 @@ namespace WDE.PedalDlyPCM41
     [MachineDecl(
         Name        = "Pedal Dly PCM41",
         ShortName   = "PdlPCM41",
-        Author      = "WDE",
+        Author      = "The Pedal",
         MaxTracks   = 0,
         InputCount  = 1,
         OutputCount = 1)]
